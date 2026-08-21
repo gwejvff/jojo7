@@ -15,9 +15,9 @@ services:
       - STATE_DIR=/app/data
       # Protect this adapter's OpenAI-compatible API.
       # ⚠️ 必须改成强口令：它既是本代理的 API Key，也是控制台登录密码
-      - API_KEY=gmailAsd769
+      - API_KEY=123456
       # Required: one or more Gemini Express Mode API keys, separated by commas.
-      - VERTEX_EXPRESS_API_KEY=your_vertex_express_api_key
+      - VERTEX_EXPRESS_API_KEY=1111111111111111111111111111111
       # Optional: set true to rotate Express keys in order instead of random selection.
       - ROUNDROBIN=false
       # Optional: fake streaming keeps client connections alive while waiting for non-streaming Gemini responses.
