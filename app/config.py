@@ -61,7 +61,6 @@ VERTEX_REASONING_TAG = REASONING_TAG
 DEFAULT_SETTINGS = {
     # 思考
     "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal)；也可强制 minimal|low|medium|high
-    "thinking_g25_budget": -1,            # Gemini 2.5 默认思考预算: -1=动态, 0=关(仅flash), 或整数
     # 生图
     "image_size": "4K",                   # 默认分辨率: 512|1K|2K|4K（按模型白名单校验）
     "image_aspect_ratio": "",             # 默认宽高比, ""=自动
@@ -155,6 +154,11 @@ DEFAULT_SETTINGS = {
     # 钉定失败（项目不匹配/该区域无此模型）会自动退回裸模型名重试一次，见
     # api_helpers.is_location_pin_failure —— 所以这个默认值不会把任何人变糟。
     "express_location": "global",
+    # 弱网可靠传输（见 resumable.py）：服务端响应缓冲 + 序列号事件 + 断线重放/分片轮询。
+    # 上游读取由后台泵任务驱动，与前端连接解绑；Google 的回复总能完整落缓冲。
+    "resumable_enabled": True,            # 总开关；关掉则回到原有直通行为
+    "resumable_ttl_seconds": 1800,        # 已完成的缓冲保留时长（秒），超时清掉
+    "resumable_max_streams": 200,         # 缓冲总数上限，超限淘汰最旧的已完成缓冲
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},
@@ -165,7 +169,6 @@ DEFAULT_SETTINGS = {
 PER_MODEL_KEYS = [
     "native_thinking_mode",
     "thinking_g3_level",
-    "thinking_g25_budget",
     "image_size",
     "image_aspect_ratio",
     "default_temperature",

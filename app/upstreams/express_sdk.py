@@ -17,7 +17,7 @@ from api_helpers import (
 )
 from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
-from http_options import get_http_options, should_use_priority_paygo
+from http_options import get_http_options
 import model_capabilities as mc
 from runtime_state import app_state
 import config as app_config
@@ -62,10 +62,8 @@ def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
 
 def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool,
                            prefill_active: bool = False) -> dict | None:
-    """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。"""
-    if is_image_model:
-        return None
-
+    """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。
+    生图模型同样下发 thinking_level（三模型默认 HIGH，用户决策 2026-10-13）。"""
     settings = app_state.get_effective_settings(base_model_name)
     t = mc.resolve_thinking(base_model_name, request, settings, prefill_active=prefill_active)
     if t.get("mode") is None:
@@ -85,8 +83,6 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
             thinking_config["thinking_level"] = t["level"]
         else:
             print(f"⚠️ [推理配置] 当前 google-genai 版本 {genai_version_str} 不支持 thinking_level，已自动跳过该参数。")
-    else:  # budget（Gemini 2.5）
-        thinking_config["thinking_budget"] = t["budget"]
 
     if app_state.get_setting("debug_outbound", False):
         print(f"🔎 [出站调试] Express 通道 模型={base_model_name} thinkingConfig={thinking_config}")
@@ -139,7 +135,8 @@ def _log_resolved_endpoint(client: Any) -> None:
         print(f"⚠️ [上游端点] 读取端点解析结果失败（不影响调用）：{e}")
 
 
-def resolve_express_model_path(base_model_name: str, settings: dict) -> str:
+def resolve_express_model_path(base_model_name: str, settings: dict,
+                               key_project_id: str = "") -> str:
     """把模型名解析成实际下发给 SDK 的 model 值。
 
     留空 express_location → 返回裸模型名，走 express 端点格式：
@@ -153,9 +150,11 @@ def resolve_express_model_path(base_model_name: str, settings: dict) -> str:
       google-genai 的 t_model() 对以 "projects/" 开头的 model 原样透传，
       因此不需要（也不能）给 Client 传 location —— api_key 与 project/location 互斥。
 
-    项目 ID 直接取「通道与凭证」页填的那个（或环境变量 GOOGLE_PROJECT_ID）——
-    一个人通常只有一个 Express 项目，不再单独配一份。
-    拿不到项目 ID 就退回裸模型名（并提示），绝不拼出半截路径。
+    项目 ID 的取值顺序（多账号支持）：
+      ① 本次选中的那个 Express Key **自己的** Project ID（启动时自动探测或人工填写）；
+      ② 环境变量 GOOGLE_PROJECT_ID / 「通道与凭证」里的全局 Project ID（旧行为兜底）；
+      ③ 都没有 → 退回裸模型名（并提示），绝不拼出半截路径。
+    ①在多账号轮换时是必须的：Key 与项目一一对应，用别人的项目会 403（需要计费/无权）。
     """
     if base_model_name.startswith(("projects/", "publishers/", "models/")):
         return base_model_name          # 客户端已自带完整路径，尊重它
@@ -164,10 +163,13 @@ def resolve_express_model_path(base_model_name: str, settings: dict) -> str:
     if not location:
         return base_model_name
 
-    project = (app_config.GOOGLE_PROJECT_ID or app_state.get_project_id() or "").strip()
+    project = (str(key_project_id or "").strip()
+               or app_config.GOOGLE_PROJECT_ID
+               or app_state.get_project_id() or "").strip()
     if not project:
-        print("⚠️ [上游端点] 已选择钉定 location，但没有可用的 Project ID"
-              "（请在控制台「通道与凭证」页填写 Project ID，或设环境变量 GOOGLE_PROJECT_ID），"
+        print("⚠️ [上游端点] 已选择钉定 location，但该 Key 没有可用的 Project ID"
+              "（请在控制台「通道与凭证」页触发探测或手动填写该 Key 的 Project ID，"
+              "也可设环境变量 GOOGLE_PROJECT_ID 兜底），"
               "本次退回默认路由。")
         return base_model_name
 
@@ -199,15 +201,16 @@ class ExpressSDKUpstream(BaseUpstream):
             )
 
         if express_key_manager_instance.get_total_keys() == 0:
-            error_msg = "未配置 VERTEX_EXPRESS_API_KEY，无法调用 Gemini Express Mode。"
+            error_msg = ("未配置任何 Express API Key，无法调用 Gemini Express Mode"
+                         "（请在控制台「通道与凭证」页添加，或设环境变量 VERTEX_EXPRESS_API_KEY）。")
             print(f"❌ [密钥配置] {error_msg}")
             return JSONResponse(
                 status_code=401,
                 content=create_openai_error_response(401, error_msg, "authentication_error"),
             )
 
-        key_tuple = express_key_manager_instance.get_express_api_key()
-        if not key_tuple:
+        key_record = express_key_manager_instance.get_express_record()
+        if not key_record:
             error_msg = "没有可用的 Express API Key。"
             print(f"❌ [密钥配置] {error_msg}")
             return JSONResponse(
@@ -215,24 +218,20 @@ class ExpressSDKUpstream(BaseUpstream):
                 content=create_openai_error_response(401, error_msg, "authentication_error"),
             )
 
-        _, express_api_key = key_tuple
+        express_api_key = key_record["key"]
         _inj_settings = app_state.get_effective_settings(base_model_name)
-        model_to_call = resolve_express_model_path(base_model_name, _inj_settings)
-        priority_paygo = should_use_priority_paygo(model_to_call)
-
+        # 多账号：location 钉定用**这个 Key 自己的**项目，而不是 Cookie 通道的全局项目
+        model_to_call = resolve_express_model_path(base_model_name, _inj_settings,
+                                                   key_project_id=key_record.get("project_id", ""))
         client_to_use = genai.Client(
             vertexai=True,
             api_key=express_api_key,
-            http_options=get_http_options(priority_paygo=priority_paygo),
+            http_options=get_http_options(),
         )
         _log_resolved_endpoint(client_to_use)
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
         if model_to_call != base_model_name:
             print(f"🌐 [上游端点] 已钉定 location：{model_to_call}")
-        if priority_paygo:
-            print("🚦 [流量等级] global 请求已附加 Priority PayGo 请求头；实际是否命中以上游 traffic_type 为准。")
-        else:
-            print("ℹ️ [流量等级] 当前未钉定 global，使用普通请求。")
 
         profile = mc.get_profile(base_model_name)
         is_image_model = profile["is_image"]
@@ -311,13 +310,13 @@ class ExpressSDKUpstream(BaseUpstream):
             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,
             fastapi_request=fastapi_request, prefill_text=prefill_text,
             # 钉定路径万一不对（Project ID 与 Key 不同项目、该区域没有此模型），
-            # 自动退回裸模型名重试一次，并改用不带 Priority 请求头的普通客户端。
+            # 自动退回裸模型名重试一次。
             fallback_model=(base_model_name if model_to_call != base_model_name else None),
             fallback_client_factory=(
                 lambda: genai.Client(
                     vertexai=True,
                     api_key=express_api_key,
-                    http_options=get_http_options(priority_paygo=False),
+                    http_options=get_http_options(),
                 )
-            ) if priority_paygo else None,
+            ),
         )
